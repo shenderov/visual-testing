@@ -1,6 +1,6 @@
 package me.shenderov.visual.services;
 
-import me.shenderov.visual.entities.Image;
+import me.shenderov.visual.entities.dao.Image;
 import me.shenderov.visual.entities.ResourceWrapper;
 import me.shenderov.visual.enums.ImageType;
 import me.shenderov.visual.interfaces.ImageStorageService;
@@ -9,10 +9,12 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.core.io.Resource;
 import org.springframework.core.io.UrlResource;
 import org.springframework.stereotype.Service;
-import org.springframework.util.FileSystemUtils;
 import org.springframework.web.multipart.MultipartFile;
 
+import javax.imageio.ImageIO;
+import java.awt.image.BufferedImage;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.math.BigInteger;
@@ -22,17 +24,21 @@ import java.nio.file.Paths;
 import java.security.DigestInputStream;
 import java.security.MessageDigest;
 import java.util.Optional;
+import java.util.UUID;
 import java.util.stream.Stream;
 
 @Service
 public class FileSystemImageStorage implements ImageStorageService {
+
     private final Path storageDir;
+    private final Path tmpDir;
     private final ImageRepository imageRepository;
 
     @Autowired
     public FileSystemImageStorage(ImageRepository imageRepository) {
         //TODO move to properties
         this.storageDir = Paths.get("src/main/resources/storage");
+        this.tmpDir = this.storageDir.resolve("tmp");
         this.imageRepository = imageRepository;
         this.init();
     }
@@ -43,13 +49,16 @@ public class FileSystemImageStorage implements ImageStorageService {
             if(!Files.isDirectory(storageDir)){
                 Files.createDirectory(storageDir);
             }
+            if(!Files.isDirectory(tmpDir)){
+                Files.createDirectory(tmpDir);
+            }
         } catch (IOException e) {
             throw new RuntimeException("Could not initialize storage", e);
         }
     }
 
     @Override
-    public void save(MultipartFile file) {
+    public Image save(MultipartFile file) {
         try {
             if (file.isEmpty()) {
                 throw new RuntimeException("Failed to store empty file " + file.getOriginalFilename());
@@ -59,10 +68,39 @@ public class FileSystemImageStorage implements ImageStorageService {
             image.setFilename(file.getOriginalFilename());
             image.setType(ImageType.IMAGE);
             image.setChecksum(checksum);
+            image.setSize(file.getSize());
             saveFile(file.getInputStream(), checksum);
-            imageRepository.save(image);
+            return imageRepository.save(image);
         } catch (IOException e) {
             throw new RuntimeException("Failed to store file " + file.getOriginalFilename(), e);
+        }
+    }
+
+    @Override
+    public Image save(File file) {
+        String filename = null;
+        if(file != null){
+            filename = file.getName();
+        }
+        return save(file, filename);
+    }
+
+    @Override
+    public Image save(File file, String filename) {
+        try {
+            if (file == null || !file.exists() || !file.isFile() || file.length() == 0) {
+                throw new RuntimeException("Failed to store empty file " + filename);
+            }
+            String checksum = getChecksum(new FileInputStream(file));
+            Image image = new Image();
+            image.setFilename(filename);
+            image.setType(ImageType.IMAGE);
+            image.setChecksum(checksum);
+            image.setSize(file.length());
+            saveFile(new FileInputStream(file), checksum);
+            return imageRepository.save(image);
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to store file " + filename, e);
         }
     }
 
@@ -82,30 +120,27 @@ public class FileSystemImageStorage implements ImageStorageService {
     }
 
     @Override
-    public ResourceWrapper get(String filename) {
-        return this.get(getImageId(filename));
-    }
-
-    @Override
-    public void delete(Long id) {
-        Optional<Image> imageOpt = imageRepository.findById(id);
-        if(imageOpt.isPresent()){
-            Image image = imageOpt.get();
-            String checksum = image.getChecksum();
-            this.deleteFile(checksum);
-            imageRepository.delete(image);
+    public BufferedImage getBufferedImage(Long id) {
+        try {
+            Resource resource = get(id).getResource();
+            return ImageIO.read(resource.getFile());
+        } catch (IOException e) {
+           throw new RuntimeException("Image not found");
         }
     }
 
     @Override
-    public void delete(String filename) {
-        this.delete(getImageId(filename));
+    public File createTmpFile() throws IOException {
+        return Files.createFile(tmpDir.resolve(UUID.randomUUID().toString())).toFile();
     }
 
     @Override
-    public void deleteAll() {
-        FileSystemUtils.deleteRecursively(storageDir.toFile());
-        imageRepository.deleteAll();
+    public void deleteTmpFile(File tmpFile) {
+        boolean delete = tmpFile.delete();
+        if(!delete){
+            //TODO replace with logger
+            System.out.println("Cannot delete temp file");
+        }
     }
 
     private Long getImageId(String filename){
@@ -173,7 +208,7 @@ public class FileSystemImageStorage implements ImageStorageService {
         return this.storageDir.resolve(checksum.substring(0, 2));
     }
 
-    public boolean isDirectoryEmpty(Path path) throws IOException {
+    private boolean isDirectoryEmpty(Path path) throws IOException {
         if (Files.isDirectory(path)) {
             try (Stream<Path> entries = Files.list(path)) {
                 return entries.findFirst().isEmpty();
